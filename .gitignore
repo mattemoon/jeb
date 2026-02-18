@@ -26,3 +26,4 @@ mutants.out.old/
 **/fuzz/coverage/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+*.gb

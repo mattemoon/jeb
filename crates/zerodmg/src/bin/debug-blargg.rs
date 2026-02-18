@@ -1,5 +1,5 @@
 //! Debug tool: instrument Blargg ROM execution with timer state tracking.
-//! Usage: debug-blargg <test> [--tima-trace] [--max N]
+//! Usage: debug-blargg <test> [--tima-trace] [--max N] [--halt-trace]
 
 use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
@@ -32,6 +32,7 @@ fn main() {
     }
     let test_name = &args[1];
     let tima_trace = args.contains(&"--tima-trace".to_string());
+    let halt_trace = args.contains(&"--halt-trace".to_string());
     let max_instructions: u64 = args.windows(2)
         .find(|w| w[0] == "--max")
         .and_then(|w| w[1].parse().ok())
@@ -48,6 +49,10 @@ fn main() {
     let mut instr_count: u64 = 0;
     let mut seen_pcs: HashSet<u16> = HashSet::new();
     let mut last_serial_len = 0;
+
+    // HALT trace: track M-cycles at key points for halt_bug timing analysis
+    let mut halt_exit_t: Option<u64> = None;
+    let mut halt_count: u64 = 0;
 
     // TIMA trace: track writes/reads to 0xFF05
     let mut tima_write_count: u64 = 0;
@@ -78,6 +83,67 @@ fn main() {
         };
 
         let tick_cycles = opex.t_1 - opex.t_0;
+
+        // HALT trace: detect HALT executions and key events
+        if halt_trace {
+            let instr_str = format!("{:?}", opex.instruction);
+            let is_halt = instr_str.contains("HALT");
+            // PC=0xC08B is the instruction after the second HALT (LD_16_IMMEDIATE(DE, 3076))
+            // PC=0xC0A0 is the IF read (LD_8_FROM_FF_IMMEDIATE(15))
+            // PC=0xC092 is first delay CALL, 0xC097 second, 0xC09C third
+            let is_after_halt2 = pc_before == 0xC08B;
+            let is_if_read = pc_before == 0xC0A0;
+            let is_delay_call = pc_before == 0xC092 || pc_before == 0xC097 || pc_before == 0xC09C;
+
+            if is_halt {
+                halt_count += 1;
+                println!("[HALT_TRACE] HALT #{} at instr={} PC=0x{:04X} t={} (M-cycles)",
+                    halt_count, instr_count, pc_before, opex.t_0);
+            }
+            if is_after_halt2 {
+                halt_exit_t = Some(opex.t_0);
+                println!("[HALT_TRACE] HALT2 exit at instr={} PC=0x{:04X} t={} (M-cycles)",
+                    instr_count, pc_before, opex.t_0);
+                // Frame boundary analysis
+                let t = opex.t_0;
+                let frame_len = 17556u64; // M-cycles per DMG frame
+                let frame_num = t / frame_len;
+                let frame_pos = t % frame_len;
+                let vblank_start = 144 * 114u64;
+                let vblank_end = 154 * 114u64;
+                println!("[HALT_TRACE]   frame={} pos={} vblank={}-{} in_vblank={}",
+                    frame_num, frame_pos, vblank_start, vblank_end,
+                    frame_pos >= vblank_start && frame_pos < vblank_end);
+            }
+            if is_delay_call {
+                let t = opex.t_0;
+                println!("[HALT_TRACE] DELAY_CALL at instr={} PC=0x{:04X} t={}", instr_count, pc_before, t);
+                if let Some(halt_t) = halt_exit_t {
+                    println!("[HALT_TRACE]   elapsed since HALT exit: {} M-cycles", t - halt_t);
+                }
+            }
+            if is_if_read {
+                let t = opex.t_0;
+                let if_val = gb.read_memory(0xFF0F);
+                println!("[HALT_TRACE] IF_READ at instr={} PC=0x{:04X} t={} IF=0x{:02X}",
+                    instr_count, pc_before, t, if_val);
+                if let Some(halt_t) = halt_exit_t {
+                    let elapsed = t - halt_t;
+                    let frame_len = 17556u64;
+                    let frame_num = t / frame_len;
+                    let frame_pos = t % frame_len;
+                    let vblank_start = 144 * 114u64;
+                    let vblank_end = 154 * 114u64;
+                    println!("[HALT_TRACE]   elapsed since HALT exit: {} M-cycles", elapsed);
+                    println!("[HALT_TRACE]   frame={} pos={} vblank={}-{} in_vblank={}",
+                        frame_num, frame_pos, vblank_start, vblank_end,
+                        frame_pos >= vblank_start && frame_pos < vblank_end);
+                    println!("[HALT_TRACE]   {} frames + {} M-cycles elapsed",
+                        elapsed / frame_len, elapsed % frame_len);
+                }
+            }
+        }
+
         let tima_before = gb.read_memory(0xFF05);
 
         for _ in 0..tick_cycles {
